@@ -31,6 +31,7 @@ const state = {
   cards: [],
   current: {},
   fields: [],
+  initialFieldValues: new Map(),
   message: "",
 };
 
@@ -189,7 +190,12 @@ function flattenSchema(schema) {
       seen.add(name);
       fields.push({ name, schema: field });
     }
-    if (fields.length) groups.push({ title: node.meta.description || inferGroupTitle(fields, fallbackTitle), fields });
+    if (fields.length) {
+      const title = node.meta.description || inferGroupTitle(fields, fallbackTitle);
+      const group = groups.find((item) => item.title === title);
+      if (group) group.fields.push(...fields);
+      else groups.push({ title, fields });
+    }
   }
 
   visit(schema);
@@ -200,7 +206,7 @@ function inferGroupTitle(fields, fallbackTitle = "参数") {
   const names = new Set(fields.map((field) => field.name));
   if (hasAny(names, ["model_train_type", "pretrained_model_name_or_path", "qwen3", "vae", "clip_l", "clip_g", "t5xxl"])) return "训练用模型";
   if (hasAny(names, ["train_data_dir", "resolution", "enable_bucket", "bucket_no_upscale"])) return "数据集设置";
-  if (hasAny(names, ["output_name", "output_dir", "save_model_as", "save_state"])) return "保存设置";
+  if (hasAny(names, ["output_name", "output_dir", "save_model_as", "save_state", "save_last_n_epochs_state"])) return "保存设置";
   if (hasAny(names, ["max_train_epochs", "train_batch_size", "gradient_checkpointing"])) return "训练相关参数";
   if (hasAny(names, ["optimizer_type", "learning_rate", "lr_scheduler", "unet_lr", "text_encoder_lr"])) return "学习率与优化器设置";
   if (hasAny(names, ["prodigy_d0", "prodigyplus_d_coef", "optimizer_args_custom"])) return "优化器专用参数";
@@ -343,28 +349,7 @@ function normalizeTrainingConfig(config) {
     if (config.dylora_unit !== undefined) config.network_args.push(`unit=${config.dylora_unit}`);
   }
 
-  const optimizerType = String(config.optimizer_type ?? "");
-  if (optimizerType.toLowerCase().startsWith("dadapt")) {
-    if (optimizerType === "DAdaptation" || optimizerType === "DAdaptAdam") {
-      config.optimizer_args.push("decouple=True", "weight_decay=0.01");
-    }
-    config.learning_rate = 1;
-    config.unet_lr = 1;
-    config.text_encoder_lr = 1;
-  } else if (optimizerType.toLowerCase() === "prodigy") {
-    config.optimizer_args.push("decouple=True", "weight_decay=0.01", "use_bias_correction=True");
-    if (config.prodigy_d_coef !== undefined) config.optimizer_args.push(`d_coef=${config.prodigy_d_coef}`);
-    if (config.lr_warmup_steps) config.optimizer_args.push("safeguard_warmup=True");
-    if (config.prodigy_d0) config.optimizer_args.push(`d0=${config.prodigy_d0}`);
-  } else if (optimizerType === "prodigyplus.ProdigyPlusScheduleFree") {
-    config.learning_rate = 1;
-    config.unet_lr = 1;
-    config.text_encoder_lr = 1;
-    config.lr_scheduler = "constant";
-    if (config.prodigyplus_d_coef !== undefined) config.optimizer_args.push(`d_coef=${config.prodigyplus_d_coef}`);
-    if (config.prodigyplus_betas) config.optimizer_args.push(`betas=${config.prodigyplus_betas}`);
-    if (config.prodigyplus_schedulefree_c !== undefined) config.optimizer_args.push(`schedulefree_c=${config.prodigyplus_schedulefree_c}`);
-  }
+  applyOptimizerRuleToConfig(config);
 
   if (config.enable_block_weights) {
     if (config.down_lr_weight !== undefined) config.network_args.push(`down_lr_weight=${config.down_lr_weight}`);
@@ -521,17 +506,31 @@ function renderTrainer(route) {
         ${groups.map(renderGroup).join("")}
       </div>
       <aside class="actions">
-        <button type="submit" class="primary">开始训练</button>
-        <button type="button" id="reset-form">全部重置</button>
-        <button type="button" id="export-config">下载配置 JSON</button>
-        <button type="button" id="export-toml">下载配置 TOML</button>
-        <label class="import-button">导入配置 JSON<input id="import-config" type="file" accept="application/json" /></label>
-        <label class="import-button">导入配置 TOML<input id="import-toml" type="file" accept=".toml,text/plain" /></label>
+        <section class="action-group">
+          <h2>训练</h2>
+          <button type="submit" class="primary">开始训练</button>
+          <button type="button" id="stop-training" class="danger">终止训练</button>
+        </section>
+        <section class="action-group">
+          <h2>配置</h2>
+          <button type="button" id="reset-form">全部重置</button>
+          <div class="config-action-row">
+            <button type="button" id="export-config" class="download-button">下载配置 JSON</button>
+            <label class="import-button import-config-button">导入配置 JSON<input id="import-config" type="file" accept="application/json" /></label>
+          </div>
+          <div class="config-action-row">
+            <button type="button" id="export-toml" class="download-button">下载配置 TOML</button>
+            <label class="import-button import-config-button">导入配置 TOML<input id="import-toml" type="file" accept=".toml,text/plain" /></label>
+          </div>
+        </section>
         <section class="generated-args">
-          <h2>生成参数</h2>
+          <h2>优化器参数预览</h2>
           <pre id="generated-args"></pre>
         </section>
-        <pre id="preview"></pre>
+        <section class="config-preview">
+          <h2>TOML 配置预览</h2>
+          <pre id="preview"></pre>
+        </section>
       </aside>
     </form>
   `;
@@ -541,9 +540,13 @@ function renderTrainer(route) {
 }
 
 function renderGroup(group) {
+  const note = group.title === "学习率与优化器设置"
+    ? `<p class="section-note">切换优化器时，部分学习率、调度器和 optimizer_args 会按优化器推荐值自动重置。</p>`
+    : "";
   return `
     <section class="panel form-section">
       <h2>${escapeHtml(group.title)}</h2>
+      ${note}
       ${group.fields.map((field) => renderField(field.name, field.schema)).join("")}
     </section>
   `;
@@ -631,11 +634,15 @@ function visibilityRule(name) {
 
 function bindForm(groups) {
   const form = document.querySelector("#trainer-form");
-  form.addEventListener("input", () => {
+  form.addEventListener("input", (event) => {
+    updateEditedField(event.target);
+    applyDependentValues();
     updateVisibility();
     updatePreview(groups);
   });
-  form.addEventListener("change", () => {
+  form.addEventListener("change", (event) => {
+    updateEditedField(event.target);
+    applyDependentValues();
     updateVisibility();
     updatePreview(groups);
   });
@@ -660,6 +667,7 @@ function bindForm(groups) {
   });
 
   document.querySelector("#reset-form").addEventListener("click", () => renderTrainer(routeFor(location.pathname)));
+  document.querySelector("#stop-training").addEventListener("click", stopTraining);
   document.querySelector("#export-config").addEventListener("click", () => downloadJson(readForm(groups)));
   document.querySelector("#export-toml").addEventListener("click", () => downloadToml(readForm(groups)));
   document.querySelector("#import-config").addEventListener("change", importConfig);
@@ -671,13 +679,48 @@ function bindForm(groups) {
         const data = await api(`/api/pick_file?picker_type=${encodeURIComponent(button.dataset.pickType)}`);
         const input = document.querySelector(`[name="${CSS.escape(button.dataset.pick)}"]`);
         input.value = data.path;
+        updateEditedField(input);
         input.dispatchEvent(new Event("input", { bubbles: true }));
       } catch (error) {
         setStatus(error.message);
       }
     });
   }
+  applyDependentValues();
   updateVisibility();
+  captureInitialFieldValues(groups);
+}
+
+function captureInitialFieldValues(groups) {
+  state.initialFieldValues = new Map();
+  for (const group of groups) {
+    for (const field of group.fields) {
+      const input = document.querySelector(`[name="${CSS.escape(field.name)}"]`);
+      if (input) state.initialFieldValues.set(field.name, fieldValue(input));
+    }
+  }
+}
+
+function updateEditedField(input) {
+  if (!input?.name || !state.initialFieldValues.has(input.name)) return;
+  const field = input.closest(".field");
+  if (!field) return;
+  field.classList.toggle("is-edited", fieldValue(input) !== state.initialFieldValues.get(input.name));
+}
+
+function updateEditedFields(groups) {
+  for (const group of groups) {
+    for (const field of group.fields) {
+      const input = document.querySelector(`[name="${CSS.escape(field.name)}"]`);
+      if (input) updateEditedField(input);
+    }
+  }
+}
+
+function fieldValue(input) {
+  if (input.type === "checkbox") return String(input.checked);
+  if (input.multiple) return Array.from(input.selectedOptions).map((option) => option.value).join("\n");
+  return input.value;
 }
 
 function readForm(groups) {
@@ -697,7 +740,7 @@ function readForm(groups) {
 function updatePreview(groups) {
   const config = readForm(groups);
   document.querySelector("#generated-args").textContent = formatGeneratedArgs(config);
-  document.querySelector("#preview").textContent = JSON.stringify(config, null, 2);
+  document.querySelector("#preview").textContent = toToml(config);
 }
 
 function updateVisibility() {
@@ -719,6 +762,76 @@ function updateVisibility() {
     const visibleFields = fields.filter((field) => field.style.display !== "none" && !field.hidden);
     section.style.display = visibleFields.length ? "" : "none";
   }
+}
+
+const optimizerRules = [
+  {
+    match: (optimizer) => optimizer.toLowerCase().startsWith("dadapt"),
+    values: {
+      learning_rate: 1,
+      unet_lr: 1,
+      text_encoder_lr: 1,
+    },
+    args: (config, optimizer) =>
+      ["DAdaptation", "DAdaptAdam"].includes(optimizer) ? ["decouple=True", "weight_decay=0.01"] : [],
+  },
+  {
+    match: (optimizer) => optimizer.toLowerCase() === "prodigy",
+    args: (config) => [
+      "decouple=True",
+      "weight_decay=0.01",
+      "use_bias_correction=True",
+      config.prodigy_d_coef !== undefined ? `d_coef=${config.prodigy_d_coef}` : null,
+      config.lr_warmup_steps ? "safeguard_warmup=True" : null,
+      config.prodigy_d0 ? `d0=${config.prodigy_d0}` : null,
+    ],
+  },
+  {
+    match: (optimizer) => ["prodigyplus.ProdigyPlusScheduleFree", "ProdigyPlusScheduleFree"].includes(optimizer),
+    values: {
+      learning_rate: 1,
+      unet_lr: 1,
+      text_encoder_lr: 1,
+      lr_scheduler: "constant",
+    },
+    args: (config) => [
+      config.prodigyplus_d_coef !== undefined ? `d_coef=${config.prodigyplus_d_coef}` : null,
+      config.prodigyplus_betas ? `betas=${config.prodigyplus_betas}` : null,
+      config.prodigyplus_schedulefree_c !== undefined ? `schedulefree_c=${config.prodigyplus_schedulefree_c}` : null,
+    ],
+  },
+];
+
+function optimizerRuleFor(optimizer) {
+  const value = String(optimizer ?? "");
+  return optimizerRules.find((rule) => rule.match(value));
+}
+
+function applyOptimizerRuleToConfig(config) {
+  const optimizer = String(config.optimizer_type ?? "");
+  const rule = optimizerRuleFor(optimizer);
+  if (!rule) return;
+
+  for (const [name, value] of Object.entries(rule.values ?? {})) {
+    config[name] = value;
+  }
+  config.optimizer_args.push(...(rule.args?.(config, optimizer) ?? []).filter(Boolean));
+}
+
+function applyDependentValues() {
+  const optimizer = document.querySelector('[name="optimizer_type"]')?.value;
+  const rule = optimizerRuleFor(optimizer);
+  if (!rule) return;
+
+  for (const [name, value] of Object.entries(rule.values ?? {})) {
+    setFieldValue(name, String(value));
+  }
+}
+
+function setFieldValue(name, value) {
+  const input = document.querySelector(`[name="${CSS.escape(name)}"]`);
+  if (!input || input.value === value) return;
+  input.value = value;
 }
 
 function formatGeneratedArgs(config) {
@@ -776,6 +889,9 @@ function applyImportedConfig(config) {
     if (input.type === "checkbox") input.checked = Boolean(value);
     else input.value = Array.isArray(value) ? value.join("\n") : value;
   }
+  applyDependentValues();
+  updateVisibility();
+  updateEditedFields(state.fields);
   updatePreview(state.fields);
 }
 
@@ -886,6 +1002,25 @@ async function renderTasks() {
       await api(`/api/tasks/terminate/${encodeURIComponent(button.dataset.terminate)}`);
       renderTasks();
     });
+  }
+}
+
+async function stopTraining() {
+  try {
+    const data = await api("/api/tasks");
+    const runningTasks = (data.tasks ?? []).filter((task) => task.status === "RUNNING");
+    if (!runningTasks.length) {
+      setStatus("当前没有正在运行的训练任务");
+      return;
+    }
+
+    const task = runningTasks[0];
+    if (!confirm(`确定要停止任务 ${task.id} 吗？`)) return;
+
+    await api(`/api/tasks/terminate/${encodeURIComponent(task.id)}`);
+    setStatus(`已停止任务 ${task.id}`);
+  } catch (error) {
+    setStatus(`停止训练失败：${error.message}`);
   }
 }
 
